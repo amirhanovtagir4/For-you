@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Particle Heart</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+</style>
+</head>
+<body>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const sstep = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+
+/* ───────── 1. HEART SHAPE: параметрическая формула + объёмная заливка ───────── */
+const heartPt = t => ({
+  x: 16 * Math.pow(Math.sin(t), 3),
+  y: 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)
+});
+function makeHeartTargets(n, scale = 0.85) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const h = heartPt(Math.random() * TAU);
+    const shell = Math.random() < 0.3;                     // 30% на контуре — чёткий силуэт
+    const r = shell ? 1 - Math.random() * 0.04 : Math.sqrt(Math.random()) * 0.97;
+    const thick = 1.4 + 7 * Math.sqrt(Math.max(0, 1 - r * r)); // «пухлость»: толще в центре
+    a[i * 3]     = h.x * r * scale;
+    a[i * 3 + 1] = (h.y * r + 2.5) * scale;
+    a[i * 3 + 2] = (Math.random() * 2 - 1) * thick * scale;
+  }
+  return a;
+}
+
+/* ───────── 2. RENDERER / SCENE ───────── */
+const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+renderer.setClearColor(0x000000, 1);
+document.body.appendChild(renderer.domElement);
+const FOV = 45, TAN = Math.tan(FOV * Math.PI / 360);
+const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 300);
+const scene = new THREE.Scene();
+const group = new THREE.Group();
+scene.add(group);
+
+/* ───────── 3. PARTICLE SYSTEM ───────── */
+const small = Math.min(innerWidth, innerHeight) < 600 || (navigator.hardwareConcurrency || 8) <= 4;
+const N = small ? 1800 : 3000;
+let active = N;                                            // адаптивное количество
+
+const pos = new Float32Array(N * 3), vel = new Float32Array(N * 3);
+const home = new Float32Array(N * 3), tgt = makeHeartTargets(N);
+const delay = new Float32Array(N), seed = new Float32Array(N), P = new Float32Array(N);
+const aSize = new Float32Array(N), aTw = new Float32Array(N);
+for (let i = 0; i < N; i++) {
+  delay[i] = Math.random(); seed[i] = Math.random();
+  aSize[i] = 0.3 + 0.55 * Math.pow(Math.random(), 2);      // вариативность размера
+  aTw[i] = 0.6 + Math.random() * 1.8;                      // скорость мерцания
+}
+const geo = new THREE.BufferGeometry();
+const posAttr = new THREE.BufferAttribute(pos, 3);
+posAttr.setUsage(THREE.DynamicDrawUsage);
+geo.setAttribute('position', posAttr);
+geo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
+geo.setAttribute('aTw', new THREE.BufferAttribute(aTw, 1));
+
+const mat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: { uTime: { value: 0 }, uScale: { value: 500 }, uCamZ: { value: 60 }, uCol: { value: new THREE.Color(0x8b5cf6) } },
+  vertexShader: `
+    attribute float aSize; attribute float aTw;
+    uniform float uTime, uScale, uCamZ; varying float vB;
+    void main(){
+      vec4 mv = modelViewMatrix * vec4(position,1.0);
+      float depth = clamp(1.0 + (uCamZ + mv.z) / 32.0, 0.45, 1.5);   // ближе = ярче и крупнее
+      vB = depth * (0.82 + 0.18 * sin(uTime * aTw + aSize * 40.0));
+      gl_PointSize = aSize * uScale / -mv.z * (0.8 + 0.3 * depth);
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `
+    uniform vec3 uCol; varying float vB;
+    void main(){
+      float d = length(gl_PointCoord - 0.5) * 2.0;
+      if (d > 1.0) discard;
+      float core = smoothstep(0.34, 0.1, d);             // яркое ядро
+      float glow = pow(1.0 - d, 3.0) * 0.6;              // мягкий bloom-ореол
+      vec3 c = mix(uCol, vec3(0.86, 0.78, 1.0), core * 0.55);
+      gl_FragColor = vec4(c * (core + glow) * vB, 1.0);
+    }`
+});
+group.add(new THREE.Points(geo, mat));
+
+/* ───────── 4. LAYOUT / RESIZE ───────── */
+let halfH = 25, halfW = 25;
+function layoutHomes() {
+  for (let i = 0; i < N; i++) {                            // «домашнее» облако на весь экран
+    home[i * 3]     = (Math.random() * 2 - 1) * halfW * 0.95;
+    home[i * 3 + 1] = (Math.random() * 2 - 1) * halfH * 0.95;
+    home[i * 3 + 2] = (Math.random() * 2 - 1) * 16;
+  }
+}
+let first = true;
+function resize() {
+  const w = innerWidth, h = innerHeight, pr = Math.min(devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(pr); renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.position.z = 60 * Math.max(1, 21 / (60 * TAN * camera.aspect)); // сердце влезает и на портрете
+  camera.updateProjectionMatrix();
+  halfH = camera.position.z * TAN; halfW = halfH * camera.aspect;
+  mat.uniforms.uScale.value = (h * pr) / (2 * TAN);
+  mat.uniforms.uCamZ.value = camera.position.z;
+  layoutHomes();
+  if (first) { pos.set(home); first = false; }
+}
+addEventListener('resize', resize); resize();
+
+/* ───────── 5. ANIMATION STATES ───────── */
+const STATES = [
+  { name: 'scatter', dur: 2.6, goal: 0, rate: 2.2 },       // облако
+  { name: 'gather',  dur: 3.4, goal: 1, rate: 1.0 },       // сборка в сердце
+  { name: 'hold',    dur: 3.4, goal: 1, rate: 1.0 }        // сердце + пульс
+];
+let si = 0, st = 1.5, pull = 0;                            // старт: короткая пауза в облаке
+
+/* ───────── 6. POINTER INTERACTION (mouse + touch) ───────── */
+const ptr = { x: 1e4, y: 1e4, on: false };
+function setPtr(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.x = ((e.clientX - r.left) / r.width * 2 - 1) * halfW;
+  ptr.y = -((e.clientY - r.top) / r.height * 2 - 1) * halfH;
+  ptr.on = true;
+}
+const cv = renderer.domElement;
+cv.addEventListener('pointermove', setPtr);
+cv.addEventListener('pointerdown', e => { setPtr(e); burst(1.15, true); si = 0; st = 0; });
+cv.addEventListener('pointerup', e => { if (e.pointerType !== 'mouse') ptr.on = false; });
+cv.addEventListener('pointerleave', () => { ptr.on = false; });
+cv.addEventListener('pointercancel', () => { ptr.on = false; });
+
+/* ───────── 7. PHYSICS ───────── */
+let yaw = 0;
+// Импульс разлёта: каждая частица получает скорость от центра (или от курсора) — частицы не пересоздаются
+function burst(strength = 1, fromPointer = false) {
+  let ox = 0, oy = 0, oz = 0;
+  if (fromPointer) { const c = Math.cos(yaw), s = Math.sin(yaw); ox = ptr.x * c; oz = ptr.x * s; oy = ptr.y; }
+  for (let i = 0; i < N; i++) {
+    const k = i * 3;
+    let dx = pos[k] - ox + (Math.random() - .5) * 6, dy = pos[k + 1] - oy + (Math.random() - .5) * 6, dz = pos[k + 2] - oz + (Math.random() - .5) * 6;
+    const l = Math.hypot(dx, dy, dz) || 1, sp = (9 + 15 * Math.random()) * strength;
+    vel[k] += dx / l * sp; vel[k + 1] += dy / l * sp; vel[k + 2] += dz / l * sp;
+  }
+}
+
+function step(dt, t) {
+  const S = STATES[si];
+  pull += (S.goal - pull) * (1 - Math.exp(-dt * S.rate));  // плавный общий easing
+  const beat = Math.pow(Math.max(0, Math.sin(t * 2.4)), 10) * 0.05 * Math.pow(pull, 4); // пульс сердца
+  const sc = 1 + beat;
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  const mx = ptr.x * c, mz = ptr.x * s, my = ptr.y;        // курсор в локальных координатах группы
+  const R = 8, R2 = R * R;
+
+  for (let i = 0; i < active; i++) {
+    const k = i * 3;
+    const p = sstep(delay[i] * 0.5, delay[i] * 0.5 + 0.5, pull);  // у каждой частицы своя задержка
+    P[i] += (p - P[i]) * Math.min(1, dt * 6);
+    const pp = P[i];
+    const x = pos[k], y = pos[k + 1], z = pos[k + 2], sd = seed[i] * TAU;
+
+    const spring = 26 * pp * pp, damp = 1.1 + 7 * pp, homeK = 0.45 * (1 - pp);
+    let ax = spring * (tgt[k] * sc - x) + homeK * (home[k] - x);
+    let ay = spring * (tgt[k + 1] * sc - y) + homeK * (home[k + 1] - y);
+    let az = spring * (tgt[k + 2] * sc - z) + homeK * (home[k + 2] - z);
+
+    // органичный шум (псевдо-curl), сильнее в облаке, лёгкое дрожание в сердце
+    const amp = (1 - pp) * 2.6 + 0.4;
+    ax += amp * (Math.sin(t * 0.7 + sd + y * 0.21) + Math.sin(t * 0.43 + z * 0.3 + sd * 3));
+    ay += amp * (Math.sin(t * 0.6 + sd * 2 + z * 0.23) + Math.sin(t * 0.51 + x * 0.27 + sd));
+    az += amp * (Math.sin(t * 0.5 + sd * 4 + x * 0.2) + Math.sin(t * 0.37 + y * 0.25));
+
+    // отталкивание от курсора
+    const dx = x - mx, dy = y - my, dz = z - mz, d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < R2) {
+      const d = Math.sqrt(d2) + 1e-3, f = (1 - d / R); const a = 190 * f * f / d;
+      ax += dx * a; ay += dy * a; az += dz * a;
+    }
+
+    const dm = Math.exp(-damp * dt);
+    vel[k]     = (vel[k] + ax * dt) * dm;
+    vel[k + 1] = (vel[k + 1] + ay * dt) * dm;
+    vel[k + 2] = (vel[k + 2] + az * dt) * dm;
+    pos[k] += vel[k] * dt; pos[k + 1] += vel[k + 1] * dt; pos[k + 2] += vel[k + 2] * dt;
+  }
+  posAttr.needsUpdate = true;
+}
+
+/* ───────── 8. MAIN LOOP + АДАПТИВНОЕ КАЧЕСТВО ───────── */
+let last = performance.now(), T = 0, acc = 0, frames = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  const raw = (now - last) / 1000; last = now;
+  const dt = Math.min(raw, 1 / 30); T += dt;
+
+  st += dt;                                                // конечный автомат состояний
+  if (st >= STATES[si].dur) {
+    st = 0; si = (si + 1) % STATES.length;
+    if (si === 0) burst(1);                                // hold → взрыв → scatter
+  }
+  yaw = Math.sin(T * 0.35) * 0.42;                         // мягкий поворот даёт ощущение объёма
+  group.rotation.y = yaw; group.rotation.x = Math.sin(T * 0.27) * 0.08;
+
+  step(dt, T);
+  mat.uniforms.uTime.value = T;
+  geo.setDrawRange(0, active);
+  renderer.render(scene, camera);
+
+  acc += raw; frames++;                                    // если FPS просел — убираем 15% частиц
+  if (acc > 2) {
+    if (acc / frames > 0.026 && active > 900) active = Math.max(900, Math.floor(active * 0.85));
+    acc = 0; frames = 0;
+  }
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
